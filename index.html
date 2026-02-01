@@ -1,0 +1,2014 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Card & Badge Scanner</title>
+
+    <!-- PWA Meta Tags -->
+    <meta name="theme-color" content="#1e40af">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Card Scanner">
+    <link rel="manifest" href="manifest.json">
+    <link rel="apple-touch-icon" href="icons/icon-192.png">
+
+    <!-- Styles -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: {
+                            50: '#eff6ff',
+                            100: '#dbeafe',
+                            200: '#bfdbfe',
+                            300: '#93c5fd',
+                            400: '#60a5fa',
+                            500: '#3b82f6',
+                            600: '#2563eb',
+                            700: '#1d4ed8',
+                            800: '#1e40af',
+                            900: '#1e3a8a',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        .camera-container {
+            position: relative;
+            width: 100%;
+            max-width: 400px;
+            aspect-ratio: 1.75 / 1;
+            background: #000;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        .camera-container video,
+        .camera-container img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .camera-overlay {
+            position: absolute;
+            inset: 0;
+            border: 3px dashed rgba(255,255,255,0.5);
+            border-radius: 12px;
+            pointer-events: none;
+        }
+        .capture-btn {
+            width: 70px;
+            height: 70px;
+            border-radius: 50%;
+            background: white;
+            border: 4px solid #1e40af;
+            cursor: pointer;
+            transition: transform 0.1s;
+        }
+        .capture-btn:active {
+            transform: scale(0.95);
+        }
+        .capture-btn-inner {
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            background: #1e40af;
+            transform: scale(0.8);
+        }
+        .processing-overlay {
+            position: absolute;
+            inset: 0;
+            background: rgba(0,0,0,0.7);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            border-radius: 12px;
+        }
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid rgba(255,255,255,0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .confidence-high { background-color: #dcfce7; border-color: #16a34a; }
+        .confidence-medium { background-color: #fef9c3; border-color: #ca8a04; }
+        .confidence-low { background-color: #fee2e2; border-color: #dc2626; }
+    </style>
+
+    <!-- React -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- Tesseract.js for OCR -->
+    <script src="https://unpkg.com/tesseract.js@5/dist/tesseract.min.js"></script>
+
+    <!-- QR Code Scanner -->
+    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+
+    <!-- Service Worker Registration -->
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('sw.js')
+                    .then(reg => console.log('Service Worker registered'))
+                    .catch(err => console.error('SW registration failed:', err));
+            });
+        }
+    </script>
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback } = React;
+
+        // ============================================
+        // CONFIGURATION
+        // ============================================
+        const CONFIG_KEY = 'businessCardScanner_config';
+
+        function getConfig() {
+            try {
+                return JSON.parse(localStorage.getItem(CONFIG_KEY)) || {};
+            } catch {
+                return {};
+            }
+        }
+
+        function saveConfig(config) {
+            localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
+        }
+
+        // ============================================
+        // TEXT PARSER - Extract fields from OCR text
+        // ============================================
+        function parseBusinessCardText(rawText) {
+            const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
+
+            const parsed = {
+                firstName: '',
+                lastName: '',
+                email: '',
+                phone: '',
+                company: '',
+                jobTitle: '',
+                website: '',
+                address: '',
+                notes: '',
+                leadSource: 'Business Card Scan',
+                confidence: {}
+            };
+
+            // Email - most reliable pattern
+            // First, clean up common OCR issues in the raw text for email detection
+            const cleanedText = rawText.replace(/@ /g, '@').replace(/ @/g, '@').replace(/\. /g, '.').replace(/ \./g, '.');
+
+            // First try standard email pattern
+            let emailMatch = cleanedText.match(/[\w.-]+@[\w.-]+\.\w{2,}/i);
+
+            // If no match, try to find split email (name on one line, @domain on next)
+            if (!emailMatch) {
+                // Look for @domain.com pattern and try to find username above it
+                const domainMatch = rawText.match(/@[\w.-]+\.\w{2,}/i);
+                if (domainMatch) {
+                    // Find the line with @ and check line before for username
+                    const linesForEmail = rawText.split('\n').map(l => l.trim());
+                    const domainLineIdx = linesForEmail.findIndex(l => l.includes(domainMatch[0]));
+                    if (domainLineIdx > 0) {
+                        const prevLine = linesForEmail[domainLineIdx - 1];
+                        // Check if previous line looks like email username (has dot, no spaces in middle)
+                        if (prevLine && /^[\w.-]+$/.test(prevLine) && prevLine.includes('.')) {
+                            emailMatch = [prevLine + domainMatch[0]];
+                        }
+                    }
+                }
+            }
+
+            if (emailMatch) {
+                parsed.email = emailMatch[0].toLowerCase();
+                parsed.confidence.email = 'high';
+            }
+
+            // Phone patterns (various formats)
+            const phonePatterns = [
+                /(\+?1?[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/,
+                /\d{3}[-.\s]\d{3}[-.\s]\d{4}/,
+                /\(\d{3}\)\s?\d{3}[-.\s]?\d{4}/
+            ];
+            for (const pattern of phonePatterns) {
+                const phoneMatch = rawText.match(pattern);
+                if (phoneMatch) {
+                    parsed.phone = phoneMatch[0].replace(/[^\d]/g, '');
+                    if (parsed.phone.length === 11 && parsed.phone.startsWith('1')) {
+                        parsed.phone = parsed.phone.slice(1);
+                    }
+                    parsed.confidence.phone = 'high';
+                    break;
+                }
+            }
+
+            // Website pattern - but exclude common email domains
+            const websiteMatch = rawText.match(/(?:https?:\/\/)?(?:www\.)?([a-zA-Z0-9-]+\.(?:com|org|net|io|co|biz|info|us|gov|edu)[^\s]*)/i);
+            if (websiteMatch) {
+                const potentialWebsite = websiteMatch[0].toLowerCase();
+                // Don't use common email providers as the website
+                if (!/gmail\.com|yahoo\.com|hotmail\.com|outlook\.com|aol\.com|icloud\.com|mail\.com/i.test(potentialWebsite)) {
+                    parsed.website = potentialWebsite;
+                    if (!parsed.website.startsWith('http')) {
+                        parsed.website = 'https://' + parsed.website;
+                    }
+                    parsed.confidence.website = 'high';
+                }
+            }
+
+            // Job title patterns
+            const titlePatterns = [
+                /\b(CEO|CFO|CTO|COO|CIO|CMO|President|Vice President|VP|Director|Manager|Supervisor|Coordinator|Specialist|Analyst|Engineer|Developer|Designer|Consultant|Associate|Assistant|Administrator|Executive|Partner|Owner|Founder|Co-Founder|Officer|REALTOR|Realtor|Agent|Broker)\b/i,
+                /\b(Sales|Marketing|Business Development|Account|Project|Product|Operations|Human Resources|HR|Finance|Legal|IT|Technology|Software|Senior|Junior|Lead|Chief|Head of)\s+\w+/i,
+                /\bREALTOR[®]?,?\s*[\w\s-]+Producer\b/i
+            ];
+            for (const pattern of titlePatterns) {
+                const titleMatch = rawText.match(pattern);
+                if (titleMatch) {
+                    // Find the full line containing this title
+                    const titleLine = lines.find(line => line.toLowerCase().includes(titleMatch[0].toLowerCase()));
+                    if (titleLine) {
+                        parsed.jobTitle = titleLine;
+                        parsed.confidence.jobTitle = 'medium';
+                    }
+                    break;
+                }
+            }
+
+            // Company patterns - look for known patterns or standalone company-like lines
+            // First check for well-known company names (highest priority, clean extraction)
+            const knownCompanies = /\b(Verizon\s*Wireless|Verizon|AT&T|T-Mobile|Sprint|Google|Microsoft|Apple|Amazon|Meta|Facebook|IBM|Oracle|Cisco|Intel|Dell|HP|Salesforce|Total Protection Solutions|Coldwell\s*Banker|Keller\s*Williams|RE\/MAX|Century\s*21|University of Central Florida|UCF|Gainesville Police|Florida Health|Cannone\s*Enterprises|M\.?M\.?\s*Parrish|Alachua County Health Department)/i;
+            const knownMatch = rawText.match(knownCompanies);
+            if (knownMatch) {
+                parsed.company = knownMatch[0].trim();
+                parsed.confidence.company = 'high';
+            } else {
+                // Try specific patterns with suffixes
+                const companyWithSuffix = rawText.match(/\b([\w\s&]+(?:Inc\.?|LLC|Corp\.?|Corporation|Company|Co\.?|Ltd\.?|Limited|Group|Solutions|Services|Technologies|Consulting|Wireless|Communications|Industries|International|Department|Agency|Bureau|Office|Division))\b/i);
+                if (companyWithSuffix) {
+                    parsed.company = companyWithSuffix[1].trim();
+                    parsed.confidence.company = 'medium';
+                }
+            }
+
+            // If no company found, try to extract from .edu email domain
+            if (!parsed.company && parsed.email && parsed.email.includes('.edu')) {
+                const eduDomainMatch = parsed.email.match(/@(?:mail\.)?([a-z]+)\.edu/i);
+                if (eduDomainMatch) {
+                    const eduDomain = eduDomainMatch[1].toUpperCase();
+                    // Map common .edu domains to full names
+                    const eduMap = {
+                        'UCF': 'University of Central Florida',
+                        'USF': 'University of South Florida',
+                        'UF': 'University of Florida',
+                        'FSU': 'Florida State University',
+                        'FIU': 'Florida International University',
+                        'FAU': 'Florida Atlantic University',
+                        'MIT': 'Massachusetts Institute of Technology',
+                        'UCLA': 'UCLA',
+                        'USC': 'University of Southern California',
+                        'NYU': 'New York University'
+                    };
+                    parsed.company = eduMap[eduDomain] || eduDomain;
+                    parsed.confidence.company = 'medium';
+                }
+            }
+
+            // Name extraction - improved strategy
+            // Strategy 1: Look for line immediately before or containing email (common pattern)
+            // Strategy 2: Look for 2-3 word lines that look like names
+            const nameExclusions = /@|www\.|\.com|\.org|\.net|\.edu|\d{3}.*\d{4}|inc\.|llc|corp|ltd|solutions|protection|total|services|technologies|ph:|cell:|fax:|p\.o\.|box|\d{5}|school|university|department|college|center|office|communication|police|operations|bureau|gainesville|florida|health|county|city|state/i;
+
+            // Find email line index
+            const emailLineIdx = parsed.email ? lines.findIndex(l => l.toLowerCase().includes(parsed.email.toLowerCase())) : -1;
+
+            // Check line before email first (very common pattern: Name on one line, email below)
+            if (emailLineIdx > 0) {
+                const lineBeforeEmail = lines[emailLineIdx - 1];
+                if (lineBeforeEmail &&
+                    !nameExclusions.test(lineBeforeEmail) &&
+                    lineBeforeEmail.length > 3 &&
+                    lineBeforeEmail.length < 35 &&
+                    /^[A-Za-z\s.-]+$/.test(lineBeforeEmail)) {
+                    const nameParts = lineBeforeEmail.split(/\s+/);
+                    if (nameParts.length >= 2 && nameParts.length <= 4) {
+                        parsed.firstName = nameParts[0];
+                        parsed.lastName = nameParts.slice(1).join(' ');
+                        parsed.confidence.name = 'high';
+                    }
+                }
+            }
+
+            // If no name found, try finding any line that looks like a name
+            if (!parsed.firstName) {
+                // First, scan ALL lines for clean "FirstName LastName" pattern (minimum 3 chars each)
+                // This catches names even when surrounded by OCR garbage
+                for (const line of lines) {
+                    // Look for two properly capitalized words with 3+ characters each
+                    const cleanNameMatch = line.match(/[^A-Za-z]?([A-Z][a-z]{2,})\s+([A-Z][a-z]{2,})[^A-Za-z]/);
+                    if (cleanNameMatch) {
+                        const potentialFirst = cleanNameMatch[1];
+                        const potentialLast = cleanNameMatch[2];
+                        // Skip if it matches exclusions (company names, titles, locations)
+                        if (!/(police|operations|bureau|gainesville|florida|health|county|city|state|school|university|department|college|center|office|communication|manager|director|president|service|wireless|verizon|million|dollar|coldwell|banker|enterprises|inc|llc|corp|solutions|technologies|consulting|international|industries|associates|partners|group|company|aurora|violin|maker|dealer|restorer)/i.test(potentialFirst + ' ' + potentialLast)) {
+                            parsed.firstName = potentialFirst;
+                            parsed.lastName = potentialLast;
+                            parsed.confidence.name = 'high';
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // If still no name, look for names with middle initial like "Robert C. Chandler"
+            if (!parsed.firstName) {
+                for (const line of lines) {
+                    // Pattern for "FirstName M. LastName" with optional title
+                    // Remove ^ and $ anchors to handle OCR garbage characters at start/end of line
+                    const nameWithMiddle = line.match(/\b([A-Z][a-z]+)\s+([A-Z]\.?)\s+([A-Z][a-z]+)(?:,?\s*(?:Ph\.?D\.?|M\.?D\.?|M\.?S\.?|M\.?B\.?A\.?|Jr\.?|Sr\.?|III?|IV))?\.?\b/);
+                    if (nameWithMiddle) {
+                        parsed.firstName = nameWithMiddle[1];
+                        parsed.lastName = nameWithMiddle[3];
+                        parsed.confidence.name = 'high';
+                        break;
+                    }
+
+                    // Pattern for "FIRSTNAME LASTNAME" (all caps) possibly with title
+                    // Remove ^ and $ anchors to handle OCR garbage characters at start/end of line
+                    const allCapsName = line.match(/\b([A-Z]{2,})\s+([A-Z]{2,})(?:,?\s*(?:Ph\.?D\.?|M\.?D\.?|M\.?S\.?|M\.?B\.?A\.?|Jr\.?|Sr\.?|III?|IV))?\.?\b/i);
+                    if (allCapsName && !/(school|university|department|office|center)/i.test(line)) {
+                        // Convert to proper case
+                        parsed.firstName = allCapsName[1].charAt(0) + allCapsName[1].slice(1).toLowerCase();
+                        parsed.lastName = allCapsName[2].charAt(0) + allCapsName[2].slice(1).toLowerCase();
+                        parsed.confidence.name = 'high';
+                        break;
+                    }
+                }
+            }
+
+            // If still no name, try standard capitalization patterns
+            if (!parsed.firstName) {
+                const usedLines = new Set();
+                if (parsed.email) usedLines.add(lines.findIndex(l => l.toLowerCase().includes(parsed.email.toLowerCase())));
+                if (parsed.phone) usedLines.add(lines.findIndex(l => l.replace(/[^\d]/g, '').includes(parsed.phone)));
+                if (parsed.company) usedLines.add(lines.findIndex(l => l.toLowerCase().includes(parsed.company.toLowerCase())));
+                if (parsed.jobTitle) usedLines.add(lines.findIndex(l => l.includes(parsed.jobTitle)));
+                if (parsed.website) usedLines.add(lines.findIndex(l => l.toLowerCase().includes(parsed.website.replace('https://', '').replace('http://', '').toLowerCase())));
+
+                // Look for name pattern: Two capitalized words (First Last)
+                // Also try to extract from lines with OCR garbage by looking for name patterns
+                for (const line of lines) {
+                    // Try to find "FirstName LastName" pattern even with garbage around it
+                    const namePattern = line.match(/\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b/);
+                    if (namePattern && !nameExclusions.test(namePattern[0])) {
+                        // Verify it's not part of company/title
+                        const fullMatch = namePattern[0];
+                        if (!/(manager|director|president|ceo|vp|account|federal|major|service|wireless|verizon|police|operations|bureau|gainesville|florida|health)/i.test(fullMatch)) {
+                            parsed.firstName = namePattern[1];
+                            parsed.lastName = namePattern[2];
+                            parsed.confidence.name = 'medium';
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Fallback: try finding any clean line that looks like a name
+            if (!parsed.firstName) {
+                const potentialNames = lines.filter((line, idx) =>
+                    line.length > 2 &&
+                    line.length < 40 &&
+                    /^[A-Za-z\s.-]+$/.test(line) &&
+                    !nameExclusions.test(line)
+                );
+
+                if (potentialNames.length > 0) {
+                    const nameParts = potentialNames[0].split(/\s+/);
+                    if (nameParts.length >= 2) {
+                        parsed.firstName = nameParts[0];
+                        parsed.lastName = nameParts.slice(1).join(' ');
+                        parsed.confidence.name = 'medium';
+                    } else if (nameParts.length === 1) {
+                        parsed.firstName = nameParts[0];
+                        parsed.confidence.name = 'low';
+                    }
+                }
+            }
+
+            // Address - look for street patterns
+            const addressMatch = rawText.match(/\d+\s+[\w\s]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Court|Ct|Circle|Cir|Suite|Ste|Floor|Fl)[.,]?\s*[\w\s,]*\d{5}(?:-\d{4})?/i);
+            if (addressMatch) {
+                parsed.address = addressMatch[0];
+                parsed.confidence.address = 'medium';
+            }
+
+            return parsed;
+        }
+
+        // ============================================
+        // PHONE FORMATTING
+        // ============================================
+        function formatPhoneNumber(value) {
+            const digits = value.replace(/\D/g, '');
+            if (digits.length === 0) return '';
+            if (digits.length <= 3) return `(${digits}`;
+            if (digits.length <= 6) return `(${digits.slice(0,3)}) ${digits.slice(3)}`;
+            return `(${digits.slice(0,3)}) ${digits.slice(3,6)}-${digits.slice(6,10)}`;
+        }
+
+        // ============================================
+        // EMAIL VALIDATION
+        // ============================================
+        function validateEmail(email) {
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+            if (!emailRegex.test(email)) {
+                return { valid: false, error: 'Please enter a valid email address' };
+            }
+
+            // Check for common typos
+            const typoMap = {
+                'gmial.com': 'gmail.com',
+                'gmal.com': 'gmail.com',
+                'gamil.com': 'gmail.com',
+                'gnail.com': 'gmail.com',
+                'yahooo.com': 'yahoo.com',
+                'yaho.com': 'yahoo.com',
+                'hotmal.com': 'hotmail.com',
+                'hotmial.com': 'hotmail.com',
+                'outlok.com': 'outlook.com',
+            };
+
+            const domain = email.split('@')[1]?.toLowerCase();
+            if (typoMap[domain]) {
+                return {
+                    valid: false,
+                    error: `Did you mean ${email.split('@')[0]}@${typoMap[domain]}?`,
+                    suggestion: `${email.split('@')[0]}@${typoMap[domain]}`
+                };
+            }
+
+            return { valid: true };
+        }
+
+        // ============================================
+        // OFFLINE QUEUE
+        // ============================================
+        const QUEUE_KEY = 'businessCardScanner_offlineQueue';
+
+        function getOfflineQueue() {
+            try {
+                return JSON.parse(localStorage.getItem(QUEUE_KEY)) || [];
+            } catch {
+                return [];
+            }
+        }
+
+        function addToOfflineQueue(data) {
+            const queue = getOfflineQueue();
+            queue.push({ ...data, queuedAt: new Date().toISOString() });
+            localStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
+        }
+
+        function clearOfflineQueue() {
+            localStorage.removeItem(QUEUE_KEY);
+        }
+
+        // ============================================
+        // HEADER COMPONENT
+        // ============================================
+        function Header({ onSettingsClick, onHelpClick, isOnline, leadCount, batchCount }) {
+            return (
+                <header className="bg-primary-800 text-white p-4 shadow-lg">
+                    <div className="max-w-lg mx-auto flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                            <div className="w-10 h-10 bg-white rounded-lg flex items-center justify-center">
+                                <svg className="w-6 h-6 text-primary-800" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
+                                </svg>
+                            </div>
+                            <div>
+                                <h1 className="text-xl font-bold">Lead Scanner</h1>
+                                <p className="text-primary-200 text-sm">Cards, badges & lanyards</p>
+                            </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                            {/* Lead Count Stats */}
+                            {(leadCount > 0 || batchCount > 0) && (
+                                <div className="flex items-center gap-1 bg-primary-700 px-2 py-1 rounded-lg text-sm">
+                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+                                    </svg>
+                                    <span>{leadCount + batchCount}</span>
+                                </div>
+                            )}
+                            {!isOnline && (
+                                <span className="bg-yellow-500 text-yellow-900 text-xs px-2 py-1 rounded-full font-medium">
+                                    Offline
+                                </span>
+                            )}
+                            <button
+                                onClick={onHelpClick}
+                                className="p-2 hover:bg-primary-700 rounded-lg transition-colors"
+                                title="Help & Instructions"
+                            >
+                                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                </svg>
+                            </button>
+                            <button
+                                onClick={onSettingsClick}
+                                className="p-2 hover:bg-primary-700 rounded-lg transition-colors"
+                                title="Settings"
+                            >
+                                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                </header>
+            );
+        }
+
+        // ============================================
+        // HELP MODAL
+        // ============================================
+        function HelpModal({ isOpen, onClose }) {
+            if (!isOpen) return null;
+
+            return (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+                    <div className="bg-white rounded-xl shadow-xl max-w-md w-full max-h-[80vh] overflow-y-auto">
+                        <div className="p-4 border-b flex justify-between items-center sticky top-0 bg-white">
+                            <h2 className="text-lg font-bold text-gray-900">How to Use Lead Scanner</h2>
+                            <button onClick={onClose} className="p-1 hover:bg-gray-100 rounded">
+                                <svg className="w-6 h-6 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                                </svg>
+                            </button>
+                        </div>
+                        <div className="p-4 space-y-4 text-sm text-gray-700">
+                            <section>
+                                <h3 className="font-semibold text-gray-900 mb-2">Scanning Cards</h3>
+                                <ul className="list-disc list-inside space-y-1">
+                                    <li>Position the card within the camera frame</li>
+                                    <li>Tap the capture button to take a photo</li>
+                                    <li>Use the <strong>rotate button</strong> if the card is sideways</li>
+                                    <li>Tap "Scan Card" to extract contact info</li>
+                                    <li>Review and correct any fields before submitting</li>
+                                </ul>
+                            </section>
+
+                            <section>
+                                <h3 className="font-semibold text-gray-900 mb-2">QR Code Mode</h3>
+                                <ul className="list-disc list-inside space-y-1">
+                                    <li>Toggle to "QR Code" at the top</li>
+                                    <li>Point camera at a QR code on the business card</li>
+                                    <li>Automatically extracts vCard/contact data</li>
+                                </ul>
+                            </section>
+
+                            <section>
+                                <h3 className="font-semibold text-gray-900 mb-2">Batch Mode</h3>
+                                <ul className="list-disc list-inside space-y-1">
+                                    <li>Enable "Batch Mode" checkbox</li>
+                                    <li>Scan multiple cards - they queue up</li>
+                                    <li>Review the queue and tap "Submit All"</li>
+                                </ul>
+                            </section>
+
+                            <section>
+                                <h3 className="font-semibold text-gray-900 mb-2">Form Features</h3>
+                                <ul className="list-disc list-inside space-y-1">
+                                    <li><strong>Voice Notes:</strong> Tap the mic icon to dictate notes</li>
+                                    <li><strong>LinkedIn:</strong> Search for the contact on LinkedIn</li>
+                                    <li><strong>Priority:</strong> Mark leads as Hot/Normal/Cold</li>
+                                    <li><strong>Rating:</strong> Give 1-5 stars for lead quality</li>
+                                    <li><strong>Follow-up:</strong> Set a reminder date</li>
+                                    <li><strong>Event:</strong> Tag which conference/event</li>
+                                </ul>
+                            </section>
+
+                            <section>
+                                <h3 className="font-semibold text-gray-900 mb-2">Export & Offline</h3>
+                                <ul className="list-disc list-inside space-y-1">
+                                    <li><strong>CSV/vCard:</strong> Export leads for backup</li>
+                                    <li><strong>Offline:</strong> Leads queue when offline and sync later</li>
+                                    <li>Lead count shows in header</li>
+                                </ul>
+                            </section>
+
+                            <section>
+                                <h3 className="font-semibold text-gray-900 mb-2">Tips for Best Results</h3>
+                                <ul className="list-disc list-inside space-y-1">
+                                    <li>Good lighting improves OCR accuracy</li>
+                                    <li>Hold camera steady and fill the frame</li>
+                                    <li>Cards with QR codes scan faster and more accurately</li>
+                                    <li>Always review extracted data before submitting</li>
+                                </ul>
+                            </section>
+                        </div>
+                        <div className="p-4 border-t">
+                            <button
+                                onClick={onClose}
+                                className="w-full px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 font-medium"
+                            >
+                                Got It
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // ============================================
+        // SETTINGS MODAL
+        // ============================================
+        function SettingsModal({ isOpen, onClose, config, onSave }) {
+            const [powerAutomateUrl, setPowerAutomateUrl] = useState(config.powerAutomateUrl || '');
+
+            if (!isOpen) return null;
+
+            const handleSave = () => {
+                onSave({ ...config, powerAutomateUrl });
+                onClose();
+            };
+
+            return (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+                    <div className="bg-white rounded-xl shadow-xl max-w-md w-full p-6">
+                        <h2 className="text-xl font-bold text-gray-900 mb-4">Settings</h2>
+
+                        <div className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">
+                                    Power Automate URL
+                                </label>
+                                <input
+                                    type="url"
+                                    value={powerAutomateUrl}
+                                    onChange={(e) => setPowerAutomateUrl(e.target.value)}
+                                    placeholder="https://prod-xx.westus.logic.azure.com/..."
+                                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 text-sm"
+                                />
+                                <p className="mt-1 text-xs text-gray-500">
+                                    Paste your Power Automate HTTP trigger URL here
+                                </p>
+                            </div>
+                        </div>
+
+                        <div className="flex gap-3 mt-6">
+                            <button
+                                onClick={onClose}
+                                className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handleSave}
+                                className="flex-1 px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700"
+                            >
+                                Save
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // ============================================
+        // CAMERA CAPTURE COMPONENT
+        // ============================================
+        // Parse vCard data from QR code
+        function parseVCard(vcard) {
+            const parsed = {
+                firstName: '',
+                lastName: '',
+                email: '',
+                phone: '',
+                company: '',
+                jobTitle: '',
+                website: '',
+                address: '',
+                leadSource: 'QR Code Scan',
+                confidence: {}
+            };
+
+            // Parse vCard fields
+            const lines = vcard.split(/\r?\n/);
+            for (const line of lines) {
+                const [key, ...valueParts] = line.split(':');
+                const value = valueParts.join(':').trim();
+
+                if (key === 'FN' || key.startsWith('FN;')) {
+                    const parts = value.split(' ');
+                    parsed.firstName = parts[0] || '';
+                    parsed.lastName = parts.slice(1).join(' ') || '';
+                    parsed.confidence.name = 'high';
+                } else if (key === 'N' || key.startsWith('N;')) {
+                    const parts = value.split(';');
+                    parsed.lastName = parts[0] || '';
+                    parsed.firstName = parts[1] || '';
+                    parsed.confidence.name = 'high';
+                } else if (key === 'EMAIL' || key.startsWith('EMAIL;')) {
+                    parsed.email = value;
+                    parsed.confidence.email = 'high';
+                } else if (key === 'TEL' || key.startsWith('TEL;')) {
+                    parsed.phone = value.replace(/[^\d+]/g, '');
+                    parsed.confidence.phone = 'high';
+                } else if (key === 'ORG' || key.startsWith('ORG;')) {
+                    parsed.company = value.split(';')[0];
+                    parsed.confidence.company = 'high';
+                } else if (key === 'TITLE' || key.startsWith('TITLE;')) {
+                    parsed.jobTitle = value;
+                    parsed.confidence.jobTitle = 'high';
+                } else if (key === 'URL' || key.startsWith('URL;')) {
+                    parsed.website = value;
+                    parsed.confidence.website = 'high';
+                } else if (key === 'ADR' || key.startsWith('ADR;')) {
+                    const adrParts = value.split(';').filter(p => p);
+                    parsed.address = adrParts.join(', ');
+                    parsed.confidence.address = 'high';
+                }
+            }
+
+            return parsed;
+        }
+
+        function CameraCapture({ onCapture, onManualEntry }) {
+            const [stream, setStream] = useState(null);
+            const [error, setError] = useState(null);
+            const [capturedImage, setCapturedImage] = useState(null);
+            const [rotation, setRotation] = useState(0);
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [ocrProgress, setOcrProgress] = useState(0);
+            const [qrMode, setQrMode] = useState(false);
+            const [qrScanner, setQrScanner] = useState(null);
+            const videoRef = useRef(null);
+            const canvasRef = useRef(null);
+            const rotateCanvasRef = useRef(null);
+            const fileInputRef = useRef(null);
+            const qrReaderRef = useRef(null);
+
+            const startCamera = async () => {
+                try {
+                    const mediaStream = await navigator.mediaDevices.getUserMedia({
+                        video: {
+                            facingMode: { ideal: 'environment' },
+                            width: { ideal: 1920 },
+                            height: { ideal: 1080 }
+                        }
+                    });
+                    setStream(mediaStream);
+                    if (videoRef.current) {
+                        videoRef.current.srcObject = mediaStream;
+                    }
+                    setError(null);
+                } catch (err) {
+                    console.error('Camera error:', err);
+                    setError('Camera access denied. You can upload an image instead.');
+                }
+            };
+
+            const stopCamera = () => {
+                if (stream) {
+                    stream.getTracks().forEach(track => track.stop());
+                    setStream(null);
+                }
+            };
+
+            useEffect(() => {
+                startCamera();
+                return () => stopCamera();
+            }, []);
+
+            const captureImage = () => {
+                if (!videoRef.current || !canvasRef.current) return;
+
+                const video = videoRef.current;
+                const canvas = canvasRef.current;
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(video, 0, 0);
+
+                const imageData = canvas.toDataURL('image/jpeg', 0.9);
+                setCapturedImage(imageData);
+                stopCamera();
+            };
+
+            const handleFileUpload = (e) => {
+                const file = e.target.files?.[0];
+                if (!file) return;
+
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    setCapturedImage(event.target.result);
+                    stopCamera();
+                };
+                reader.readAsDataURL(file);
+            };
+
+            const retake = () => {
+                setCapturedImage(null);
+                setRotation(0);
+                setOcrProgress(0);
+                startCamera();
+            };
+
+            const rotateImage = () => {
+                setRotation((prev) => (prev + 90) % 360);
+            };
+
+            // Get rotated image data URL for OCR processing
+            const getRotatedImage = () => {
+                return new Promise((resolve) => {
+                    if (rotation === 0) {
+                        resolve(capturedImage);
+                        return;
+                    }
+
+                    const img = new Image();
+                    img.onload = () => {
+                        const canvas = rotateCanvasRef.current || document.createElement('canvas');
+                        const ctx = canvas.getContext('2d');
+
+                        // Swap dimensions for 90/270 degree rotations
+                        if (rotation === 90 || rotation === 270) {
+                            canvas.width = img.height;
+                            canvas.height = img.width;
+                        } else {
+                            canvas.width = img.width;
+                            canvas.height = img.height;
+                        }
+
+                        ctx.translate(canvas.width / 2, canvas.height / 2);
+                        ctx.rotate((rotation * Math.PI) / 180);
+                        ctx.drawImage(img, -img.width / 2, -img.height / 2);
+
+                        resolve(canvas.toDataURL('image/jpeg', 0.9));
+                    };
+                    img.src = capturedImage;
+                });
+            };
+
+            const processImage = async () => {
+                if (!capturedImage) return;
+
+                // Get the properly rotated image for OCR
+                const imageToProcess = await getRotatedImage();
+
+                setIsProcessing(true);
+                setOcrProgress(0);
+
+                try {
+                    const result = await Tesseract.recognize(
+                        imageToProcess,
+                        'eng',
+                        {
+                            logger: (m) => {
+                                if (m.status === 'recognizing text') {
+                                    setOcrProgress(Math.round(m.progress * 100));
+                                }
+                            }
+                        }
+                    );
+
+                    const parsedData = parseBusinessCardText(result.data.text);
+                    // Pass the rotated image (base64) along with parsed data for SharePoint storage
+                    onCapture(parsedData, result.data.text, imageToProcess);
+                } catch (err) {
+                    console.error('OCR error:', err);
+                    setError('Failed to process image. Please try again or enter manually.');
+                    setIsProcessing(false);
+                }
+            };
+
+            // QR Code scanning
+            const startQrScanner = async () => {
+                try {
+                    // Stop regular camera if running
+                    if (stream) {
+                        stream.getTracks().forEach(t => t.stop());
+                        setStream(null);
+                    }
+
+                    const html5QrCode = new Html5Qrcode("qr-reader");
+                    setQrScanner(html5QrCode);
+
+                    await html5QrCode.start(
+                        { facingMode: "environment" },
+                        { fps: 10, qrbox: { width: 250, height: 250 } },
+                        (decodedText) => {
+                            // Success callback
+                            html5QrCode.stop();
+                            setQrScanner(null);
+                            setQrMode(false);
+
+                            // Check if it's a vCard
+                            if (decodedText.includes('BEGIN:VCARD')) {
+                                const parsedData = parseVCard(decodedText);
+                                onCapture(parsedData, decodedText, null);
+                            } else if (decodedText.includes('@') || decodedText.startsWith('MECARD:')) {
+                                // MECARD format or simple contact info
+                                const parsed = {
+                                    firstName: '',
+                                    lastName: '',
+                                    email: '',
+                                    phone: '',
+                                    company: '',
+                                    jobTitle: '',
+                                    website: '',
+                                    address: '',
+                                    leadSource: 'QR Code Scan',
+                                    confidence: {}
+                                };
+
+                                if (decodedText.startsWith('MECARD:')) {
+                                    // Parse MECARD format: MECARD:N:Name;TEL:123;EMAIL:email@example.com;;
+                                    const parts = decodedText.replace('MECARD:', '').split(';');
+                                    for (const part of parts) {
+                                        const [key, value] = part.split(':');
+                                        if (key === 'N' && value) {
+                                            const nameParts = value.split(',');
+                                            parsed.lastName = nameParts[0] || '';
+                                            parsed.firstName = nameParts[1] || '';
+                                        } else if (key === 'TEL') parsed.phone = value;
+                                        else if (key === 'EMAIL') parsed.email = value;
+                                        else if (key === 'ORG') parsed.company = value;
+                                        else if (key === 'URL') parsed.website = value;
+                                        else if (key === 'ADR') parsed.address = value;
+                                    }
+                                } else {
+                                    // Just a URL or email
+                                    if (decodedText.includes('@')) parsed.email = decodedText;
+                                    else if (decodedText.startsWith('http')) parsed.website = decodedText;
+                                }
+
+                                onCapture(parsed, decodedText, null);
+                            } else {
+                                // Unknown format - treat as note
+                                onCapture({ notes: decodedText, leadSource: 'QR Code Scan' }, decodedText, null);
+                            }
+                        },
+                        (errorMessage) => {
+                            // Error callback (scanning in progress, not a QR code found yet)
+                        }
+                    );
+                } catch (err) {
+                    console.error('QR Scanner error:', err);
+                    setError('Failed to start QR scanner. Try using the camera instead.');
+                    setQrMode(false);
+                }
+            };
+
+            const stopQrScanner = () => {
+                if (qrScanner) {
+                    qrScanner.stop().then(() => {
+                        setQrScanner(null);
+                        setQrMode(false);
+                        startCamera();
+                    });
+                }
+            };
+
+            // Toggle QR mode
+            useEffect(() => {
+                if (qrMode) {
+                    startQrScanner();
+                } else if (qrScanner) {
+                    stopQrScanner();
+                }
+            }, [qrMode]);
+
+            return (
+                <div className="flex flex-col items-center gap-4">
+                    {/* Mode Toggle */}
+                    <div className="flex bg-gray-100 rounded-lg p-1 w-full max-w-xs">
+                        <button
+                            onClick={() => { setQrMode(false); if (!stream && !capturedImage) startCamera(); }}
+                            className={`flex-1 py-2 px-4 rounded-md text-sm font-medium transition-colors ${!qrMode ? 'bg-white shadow text-primary-700' : 'text-gray-600'}`}
+                        >
+                            Card/Badge
+                        </button>
+                        <button
+                            onClick={() => { setCapturedImage(null); setQrMode(true); }}
+                            className={`flex-1 py-2 px-4 rounded-md text-sm font-medium transition-colors ${qrMode ? 'bg-white shadow text-primary-700' : 'text-gray-600'}`}
+                        >
+                            QR Code
+                        </button>
+                    </div>
+
+                    {/* QR Reader Container */}
+                    {qrMode && (
+                        <div className="camera-container">
+                            <div id="qr-reader" ref={qrReaderRef} style={{ width: '100%' }}></div>
+                        </div>
+                    )}
+
+                    {/* Regular Camera */}
+                    {!qrMode && (
+                    <div className="camera-container">
+                        {!capturedImage ? (
+                            <>
+                                <video
+                                    ref={videoRef}
+                                    autoPlay
+                                    playsInline
+                                    muted
+                                    className={error ? 'hidden' : ''}
+                                />
+                                {error && (
+                                    <div className="absolute inset-0 flex items-center justify-center bg-gray-800 text-white p-4 text-center">
+                                        <div>
+                                            <svg className="w-12 h-12 mx-auto mb-2 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+                                            </svg>
+                                            <p className="text-sm">{error}</p>
+                                        </div>
+                                    </div>
+                                )}
+                                <div className="camera-overlay" />
+                            </>
+                        ) : (
+                            <>
+                                <img
+                                    src={capturedImage}
+                                    alt="Captured"
+                                    style={{ transform: `rotate(${rotation}deg)` }}
+                                />
+                                {isProcessing && (
+                                    <div className="processing-overlay">
+                                        <div className="spinner mb-3" />
+                                        <p className="text-sm font-medium">Processing...</p>
+                                        <p className="text-xs opacity-75">{ocrProgress}%</p>
+                                    </div>
+                                )}
+                            </>
+                        )}
+                    </div>
+                    )}
+
+                    <canvas ref={canvasRef} className="hidden" />
+                    <canvas ref={rotateCanvasRef} className="hidden" />
+                    <input
+                        type="file"
+                        ref={fileInputRef}
+                        accept="image/*"
+                        capture="environment"
+                        onChange={handleFileUpload}
+                        className="hidden"
+                    />
+
+                    {!qrMode && (
+                    <div className="flex flex-col items-center gap-3 w-full max-w-xs">
+                        {!capturedImage ? (
+                            <>
+                                <button
+                                    onClick={captureImage}
+                                    disabled={!!error}
+                                    className="capture-btn disabled:opacity-50"
+                                >
+                                    <div className="capture-btn-inner" />
+                                </button>
+                                <div className="flex gap-3 w-full">
+                                    <button
+                                        onClick={() => fileInputRef.current?.click()}
+                                        className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 text-sm font-medium"
+                                    >
+                                        Upload Image
+                                    </button>
+                                    <button
+                                        onClick={onManualEntry}
+                                        className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 text-sm font-medium"
+                                    >
+                                        Manual Entry
+                                    </button>
+                                </div>
+                            </>
+                        ) : (
+                            <>
+                                <div className="flex gap-3 w-full">
+                                    <button
+                                        onClick={retake}
+                                        disabled={isProcessing}
+                                        className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 disabled:opacity-50"
+                                    >
+                                        Retake
+                                    </button>
+                                    <button
+                                        onClick={rotateImage}
+                                        disabled={isProcessing}
+                                        className="px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 disabled:opacity-50"
+                                        title="Rotate 90°"
+                                    >
+                                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                                        </svg>
+                                    </button>
+                                    <button
+                                        onClick={processImage}
+                                        disabled={isProcessing}
+                                        className="flex-1 px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 font-medium"
+                                    >
+                                        {isProcessing ? 'Processing...' : 'Scan Card'}
+                                    </button>
+                                </div>
+                                {rotation !== 0 && (
+                                    <p className="text-xs text-primary-600">Rotated {rotation}°</p>
+                                )}
+                            </>
+                        )}
+                    </div>
+                    )}
+
+                    <p className="text-xs text-gray-500 text-center max-w-xs">
+                        {qrMode
+                            ? 'Point your camera at a QR code on the business card'
+                            : capturedImage
+                            ? 'Use the rotate button if the card is sideways'
+                            : 'Position the card, badge, or lanyard within the frame and tap capture'
+                        }
+                    </p>
+                </div>
+            );
+        }
+
+        // ============================================
+        // LEAD FORM COMPONENT
+        // ============================================
+        function LeadForm({ initialData, rawText, onSubmit, onBack, isSubmitting, events = [], onAddEvent }) {
+            const [formData, setFormData] = useState({
+                firstName: initialData?.firstName || '',
+                lastName: initialData?.lastName || '',
+                email: initialData?.email || '',
+                phone: initialData?.phone ? formatPhoneNumber(initialData.phone) : '',
+                company: initialData?.company || '',
+                jobTitle: initialData?.jobTitle || '',
+                website: initialData?.website || '',
+                address: initialData?.address || '',
+                notes: initialData?.notes || '',
+                leadSource: initialData?.leadSource || 'Business Card Scan',
+                // New fields
+                event: initialData?.event || '',
+                priority: initialData?.priority || 'normal', // normal, hot, cold
+                followUpDate: initialData?.followUpDate || '',
+                rating: initialData?.rating || 0 // 0-5 stars
+            });
+            const [errors, setErrors] = useState({});
+            const [showRawText, setShowRawText] = useState(false);
+            const [isRecording, setIsRecording] = useState(false);
+            const [showNewEvent, setShowNewEvent] = useState(false);
+            const [newEventName, setNewEventName] = useState('');
+            const confidence = initialData?.confidence || {};
+            const recognitionRef = React.useRef(null);
+
+            const handleChange = (field, value) => {
+                if (field === 'phone') {
+                    value = formatPhoneNumber(value);
+                }
+                setFormData(prev => ({ ...prev, [field]: value }));
+
+                // Clear error when user types
+                if (errors[field]) {
+                    setErrors(prev => ({ ...prev, [field]: null }));
+                }
+            };
+
+            const handleEmailSuggestion = () => {
+                const validation = validateEmail(formData.email);
+                if (validation.suggestion) {
+                    setFormData(prev => ({ ...prev, email: validation.suggestion }));
+                    setErrors(prev => ({ ...prev, email: null }));
+                }
+            };
+
+            const validate = () => {
+                const newErrors = {};
+
+                if (!formData.firstName.trim()) {
+                    newErrors.firstName = 'First name is required';
+                }
+                if (!formData.lastName.trim()) {
+                    newErrors.lastName = 'Last name is required';
+                }
+                if (!formData.email.trim()) {
+                    newErrors.email = 'Email is required';
+                } else {
+                    const emailValidation = validateEmail(formData.email);
+                    if (!emailValidation.valid) {
+                        newErrors.email = emailValidation.error;
+                    }
+                }
+
+                setErrors(newErrors);
+                return Object.keys(newErrors).length === 0;
+            };
+
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                if (validate()) {
+                    onSubmit(formData);
+                }
+            };
+
+            const getConfidenceClass = (field) => {
+                const level = confidence[field];
+                if (level === 'high') return 'confidence-high';
+                if (level === 'medium') return 'confidence-medium';
+                if (level === 'low') return 'confidence-low';
+                return '';
+            };
+
+            const InputField = ({ label, field, type = 'text', required = false, placeholder = '', multiline = false }) => (
+                <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                        {label} {required && <span className="text-red-500">*</span>}
+                    </label>
+                    {multiline ? (
+                        <textarea
+                            value={formData[field]}
+                            onChange={(e) => handleChange(field, e.target.value)}
+                            placeholder={placeholder}
+                            rows={3}
+                            className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 ${
+                                errors[field] ? 'border-red-500' : getConfidenceClass(field) || 'border-gray-300'
+                            }`}
+                        />
+                    ) : (
+                        <input
+                            type={type}
+                            value={formData[field]}
+                            onChange={(e) => handleChange(field, e.target.value)}
+                            placeholder={placeholder}
+                            className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 ${
+                                errors[field] ? 'border-red-500' : getConfidenceClass(field) || 'border-gray-300'
+                            }`}
+                        />
+                    )}
+                    {errors[field] && (
+                        <p className="mt-1 text-sm text-red-600 flex items-center gap-1">
+                            {errors[field]}
+                            {errors[field]?.includes('Did you mean') && (
+                                <button
+                                    type="button"
+                                    onClick={handleEmailSuggestion}
+                                    className="text-primary-600 underline ml-1"
+                                >
+                                    Use suggestion
+                                </button>
+                            )}
+                        </p>
+                    )}
+                </div>
+            );
+
+            return (
+                <form onSubmit={handleSubmit} className="space-y-4">
+                    {rawText && (
+                        <div className="bg-gray-50 rounded-lg p-3">
+                            <button
+                                type="button"
+                                onClick={() => setShowRawText(!showRawText)}
+                                className="text-sm text-primary-600 font-medium flex items-center gap-1"
+                            >
+                                {showRawText ? 'Hide' : 'Show'} scanned text
+                                <svg className={`w-4 h-4 transition-transform ${showRawText ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                                </svg>
+                            </button>
+                            {showRawText && (
+                                <pre className="mt-2 text-xs text-gray-600 whitespace-pre-wrap font-mono bg-white p-2 rounded border">
+                                    {rawText}
+                                </pre>
+                            )}
+                        </div>
+                    )}
+
+                    <div className="grid grid-cols-2 gap-3">
+                        <InputField label="First Name" field="firstName" required placeholder="John" />
+                        <InputField label="Last Name" field="lastName" required placeholder="Smith" />
+                    </div>
+
+                    <InputField label="Email" field="email" type="email" required placeholder="john@company.com" />
+
+                    {/* LinkedIn Lookup Button */}
+                    {(formData.firstName || formData.lastName || formData.company) && (
+                        <button
+                            type="button"
+                            onClick={() => {
+                                const query = encodeURIComponent(`${formData.firstName} ${formData.lastName} ${formData.company}`.trim());
+                                window.open(`https://www.linkedin.com/search/results/people/?keywords=${query}`, '_blank');
+                            }}
+                            className="w-full px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium flex items-center justify-center gap-2"
+                        >
+                            <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                                <path d="M19 0h-14c-2.761 0-5 2.239-5 5v14c0 2.761 2.239 5 5 5h14c2.762 0 5-2.239 5-5v-14c0-2.761-2.238-5-5-5zm-11 19h-3v-11h3v11zm-1.5-12.268c-.966 0-1.75-.79-1.75-1.764s.784-1.764 1.75-1.764 1.75.79 1.75 1.764-.783 1.764-1.75 1.764zm13.5 12.268h-3v-5.604c0-3.368-4-3.113-4 0v5.604h-3v-11h3v1.765c1.396-2.586 7-2.777 7 2.476v6.759z"/>
+                            </svg>
+                            Search on LinkedIn
+                        </button>
+                    )}
+
+                    <InputField label="Phone" field="phone" type="tel" placeholder="(555) 123-4567" />
+                    <InputField label="Company" field="company" placeholder="Acme Inc." />
+                    <InputField label="Job Title" field="jobTitle" placeholder="Sales Manager" />
+                    <InputField label="Website" field="website" type="url" placeholder="https://company.com" />
+                    <InputField label="Address" field="address" multiline placeholder="123 Main St, City, State 12345" />
+
+                    {/* Notes with Voice Input */}
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">Notes</label>
+                        <div className="relative">
+                            <textarea
+                                value={formData.notes}
+                                onChange={(e) => handleChange('notes', e.target.value)}
+                                placeholder="Add any notes about this lead..."
+                                rows={3}
+                                className="w-full px-3 py-2 pr-12 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                            />
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+                                        alert('Voice input is not supported in this browser. Try Chrome or Edge.');
+                                        return;
+                                    }
+
+                                    if (isRecording) {
+                                        recognitionRef.current?.stop();
+                                        setIsRecording(false);
+                                    } else {
+                                        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+                                        const recognition = new SpeechRecognition();
+                                        recognition.continuous = true;
+                                        recognition.interimResults = true;
+
+                                        recognition.onresult = (event) => {
+                                            let transcript = '';
+                                            for (let i = 0; i < event.results.length; i++) {
+                                                transcript += event.results[i][0].transcript;
+                                            }
+                                            setFormData(prev => ({
+                                                ...prev,
+                                                notes: prev.notes + (prev.notes ? ' ' : '') + transcript
+                                            }));
+                                        };
+
+                                        recognition.onerror = (event) => {
+                                            console.error('Speech recognition error:', event.error);
+                                            setIsRecording(false);
+                                        };
+
+                                        recognition.onend = () => setIsRecording(false);
+
+                                        recognitionRef.current = recognition;
+                                        recognition.start();
+                                        setIsRecording(true);
+                                    }
+                                }}
+                                className={`absolute right-2 top-2 p-2 rounded-full ${isRecording ? 'bg-red-500 text-white animate-pulse' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
+                                title={isRecording ? 'Stop recording' : 'Voice input'}
+                            >
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                                </svg>
+                            </button>
+                        </div>
+                        {isRecording && <p className="text-xs text-red-500 mt-1">Recording... tap mic to stop</p>}
+                    </div>
+
+                    {/* Event/Conference Selection */}
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">Event/Conference</label>
+                        {!showNewEvent ? (
+                            <div className="flex gap-2">
+                                <select
+                                    value={formData.event}
+                                    onChange={(e) => handleChange('event', e.target.value)}
+                                    className="flex-1 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                                >
+                                    <option value="">Select event...</option>
+                                    {events.map(event => (
+                                        <option key={event} value={event}>{event}</option>
+                                    ))}
+                                </select>
+                                <button
+                                    type="button"
+                                    onClick={() => setShowNewEvent(true)}
+                                    className="px-3 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
+                                    title="Add new event"
+                                >
+                                    <svg className="w-5 h-5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                                    </svg>
+                                </button>
+                            </div>
+                        ) : (
+                            <div className="flex gap-2">
+                                <input
+                                    type="text"
+                                    value={newEventName}
+                                    onChange={(e) => setNewEventName(e.target.value)}
+                                    placeholder="Enter event name..."
+                                    className="flex-1 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                                />
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        if (newEventName.trim()) {
+                                            onAddEvent(newEventName.trim());
+                                            handleChange('event', newEventName.trim());
+                                            setNewEventName('');
+                                        }
+                                        setShowNewEvent(false);
+                                    }}
+                                    className="px-3 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700"
+                                >
+                                    Add
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => { setShowNewEvent(false); setNewEventName(''); }}
+                                    className="px-3 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
+                                >
+                                    Cancel
+                                </button>
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Priority/Rating Section */}
+                    <div className="grid grid-cols-2 gap-3">
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-1">Priority</label>
+                            <div className="flex gap-1">
+                                {['cold', 'normal', 'hot'].map((p) => (
+                                    <button
+                                        key={p}
+                                        type="button"
+                                        onClick={() => handleChange('priority', p)}
+                                        className={`flex-1 px-2 py-2 rounded-lg text-sm font-medium border ${
+                                            formData.priority === p
+                                                ? p === 'hot' ? 'bg-red-500 text-white border-red-500'
+                                                : p === 'cold' ? 'bg-blue-500 text-white border-blue-500'
+                                                : 'bg-gray-500 text-white border-gray-500'
+                                                : 'border-gray-300 text-gray-700 hover:bg-gray-50'
+                                        }`}
+                                    >
+                                        {p === 'hot' ? '🔥 Hot' : p === 'cold' ? '❄️ Cold' : '➖ Normal'}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-1">Rating</label>
+                            <div className="flex gap-1">
+                                {[1, 2, 3, 4, 5].map((star) => (
+                                    <button
+                                        key={star}
+                                        type="button"
+                                        onClick={() => handleChange('rating', star)}
+                                        className="p-1"
+                                    >
+                                        <svg
+                                            className={`w-6 h-6 ${formData.rating >= star ? 'text-yellow-400 fill-current' : 'text-gray-300'}`}
+                                            fill={formData.rating >= star ? 'currentColor' : 'none'}
+                                            stroke="currentColor"
+                                            viewBox="0 0 24 24"
+                                        >
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z" />
+                                        </svg>
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Follow-up Date */}
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">Follow-up Date</label>
+                        <input
+                            type="datetime-local"
+                            value={formData.followUpDate}
+                            onChange={(e) => handleChange('followUpDate', e.target.value)}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                        />
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">Lead Source</label>
+                        <select
+                            value={formData.leadSource}
+                            onChange={(e) => handleChange('leadSource', e.target.value)}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                        >
+                            <option value="Business Card Scan">Business Card Scan</option>
+                            <option value="Conference Badge">Conference Badge</option>
+                            <option value="QR Code Scan">QR Code Scan</option>
+                            <option value="Trade Show">Trade Show</option>
+                            <option value="Conference">Conference</option>
+                            <option value="Networking Event">Networking Event</option>
+                            <option value="Referral">Referral</option>
+                            <option value="Other">Other</option>
+                        </select>
+                    </div>
+
+                    <div className="flex gap-3 pt-4">
+                        <button
+                            type="button"
+                            onClick={onBack}
+                            disabled={isSubmitting}
+                            className="flex-1 px-4 py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 disabled:opacity-50 font-medium"
+                        >
+                            Back
+                        </button>
+                        <button
+                            type="submit"
+                            disabled={isSubmitting}
+                            className="flex-1 px-4 py-3 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 font-medium flex items-center justify-center gap-2"
+                        >
+                            {isSubmitting ? (
+                                <>
+                                    <div className="spinner w-5 h-5 border-2" />
+                                    Submitting...
+                                </>
+                            ) : (
+                                'Submit Lead'
+                            )}
+                        </button>
+                    </div>
+                </form>
+            );
+        }
+
+        // ============================================
+        // SUCCESS SCREEN
+        // ============================================
+        function SuccessScreen({ onScanAnother, wasQueued }) {
+            return (
+                <div className="text-center py-8">
+                    <div className="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                        <svg className="w-10 h-10 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                        </svg>
+                    </div>
+                    <h2 className="text-2xl font-bold text-gray-900 mb-2">
+                        {wasQueued ? 'Lead Queued!' : 'Lead Submitted!'}
+                    </h2>
+                    <p className="text-gray-600 mb-6">
+                        {wasQueued
+                            ? 'Your lead has been saved and will be submitted when you\'re back online.'
+                            : 'The lead has been successfully added to your SharePoint list.'
+                        }
+                    </p>
+                    <button
+                        onClick={onScanAnother}
+                        className="px-6 py-3 bg-primary-600 text-white rounded-lg hover:bg-primary-700 font-medium"
+                    >
+                        Scan Another Card
+                    </button>
+                </div>
+            );
+        }
+
+        // ============================================
+        // MAIN APP
+        // ============================================
+        // Events storage
+        const EVENTS_KEY = 'businessCardScanner_events';
+        function getEvents() {
+            try {
+                return JSON.parse(localStorage.getItem(EVENTS_KEY)) || [];
+            } catch {
+                return [];
+            }
+        }
+        function saveEvents(events) {
+            localStorage.setItem(EVENTS_KEY, JSON.stringify(events));
+        }
+
+        // Batch queue storage
+        const BATCH_KEY = 'businessCardScanner_batch';
+        function getBatchQueue() {
+            try {
+                return JSON.parse(localStorage.getItem(BATCH_KEY)) || [];
+            } catch {
+                return [];
+            }
+        }
+        function saveBatchQueue(batch) {
+            localStorage.setItem(BATCH_KEY, JSON.stringify(batch));
+        }
+
+        function App() {
+            const [screen, setScreen] = useState('camera'); // camera, form, success, batch
+            const [scannedData, setScannedData] = useState(null);
+            const [rawText, setRawText] = useState('');
+            const [cardImage, setCardImage] = useState(null); // Store captured card image for SharePoint
+            const [isSubmitting, setIsSubmitting] = useState(false);
+            const [wasQueued, setWasQueued] = useState(false);
+            const [showSettings, setShowSettings] = useState(false);
+            const [showHelp, setShowHelp] = useState(false);
+            const [config, setConfig] = useState(getConfig());
+            const [isOnline, setIsOnline] = useState(navigator.onLine);
+            // New state for features
+            const [events, setEvents] = useState(getEvents());
+            const [batchMode, setBatchMode] = useState(false);
+            const [batchQueue, setBatchQueue] = useState(getBatchQueue());
+            const [showExport, setShowExport] = useState(false);
+            const [duplicateWarning, setDuplicateWarning] = useState(null);
+            const [teamLeadCount, setTeamLeadCount] = useState(0);
+
+            useEffect(() => {
+                const handleOnline = () => setIsOnline(true);
+                const handleOffline = () => setIsOnline(false);
+
+                window.addEventListener('online', handleOnline);
+                window.addEventListener('offline', handleOffline);
+
+                return () => {
+                    window.removeEventListener('online', handleOnline);
+                    window.removeEventListener('offline', handleOffline);
+                };
+            }, []);
+
+            // Sync offline queue when back online
+            useEffect(() => {
+                if (isOnline && config.powerAutomateUrl) {
+                    const queue = getOfflineQueue();
+                    if (queue.length > 0) {
+                        syncOfflineQueue(queue, config.powerAutomateUrl);
+                    }
+                }
+            }, [isOnline, config.powerAutomateUrl]);
+
+            const syncOfflineQueue = async (queue, url) => {
+                for (const item of queue) {
+                    try {
+                        await fetch(url, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(item.payload)
+                        });
+                    } catch (err) {
+                        console.error('Failed to sync queued item:', err);
+                        return; // Stop if one fails, will retry later
+                    }
+                }
+                clearOfflineQueue();
+            };
+
+            const handleCapture = (data, text, imageBase64) => {
+                setScannedData(data);
+                setRawText(text);
+                setCardImage(imageBase64); // Store the card image
+                setScreen('form');
+            };
+
+            const handleManualEntry = () => {
+                setScannedData({});
+                setRawText('');
+                setCardImage(null); // No image for manual entry
+                setScreen('form');
+            };
+
+            const handleSubmit = async (formData) => {
+                if (!config.powerAutomateUrl) {
+                    alert('Please configure your Power Automate URL in Settings first.');
+                    setShowSettings(true);
+                    return;
+                }
+
+                setIsSubmitting(true);
+
+                const payload = {
+                    ...formData,
+                    submittedAt: new Date().toISOString(),
+                    deviceType: /mobile|android|iphone|ipad/i.test(navigator.userAgent) ? 'mobile' : 'desktop',
+                    cardImage: cardImage || null // Include base64 image for SharePoint storage
+                };
+
+                try {
+                    if (!isOnline) {
+                        addToOfflineQueue({ payload });
+                        setWasQueued(true);
+                        setScreen('success');
+                    } else {
+                        const response = await fetch(config.powerAutomateUrl, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        });
+
+                        if (!response.ok) {
+                            throw new Error('Submission failed');
+                        }
+
+                        setWasQueued(false);
+                        setScreen('success');
+                    }
+                } catch (err) {
+                    console.error('Submit error:', err);
+                    // Queue for later if submission fails
+                    addToOfflineQueue({ payload });
+                    setWasQueued(true);
+                    setScreen('success');
+                } finally {
+                    setIsSubmitting(false);
+                }
+            };
+
+            const handleScanAnother = () => {
+                setScannedData(null);
+                setRawText('');
+                setCardImage(null);
+                setWasQueued(false);
+                setScreen('camera');
+            };
+
+            const handleSaveConfig = (newConfig) => {
+                setConfig(newConfig);
+                saveConfig(newConfig);
+            };
+
+            // Add new event
+            const handleAddEvent = (eventName) => {
+                if (!events.includes(eventName)) {
+                    const newEvents = [...events, eventName];
+                    setEvents(newEvents);
+                    saveEvents(newEvents);
+                }
+            };
+
+            // Batch mode handlers
+            const handleAddToBatch = (formData) => {
+                const newBatch = [...batchQueue, { ...formData, cardImage, id: Date.now() }];
+                setBatchQueue(newBatch);
+                saveBatchQueue(newBatch);
+                setScannedData(null);
+                setRawText('');
+                setCardImage(null);
+                setScreen('camera');
+            };
+
+            const handleSubmitBatch = async () => {
+                for (const lead of batchQueue) {
+                    await handleSubmit(lead);
+                }
+                setBatchQueue([]);
+                saveBatchQueue([]);
+                setBatchMode(false);
+            };
+
+            const handleRemoveFromBatch = (id) => {
+                const newBatch = batchQueue.filter(item => item.id !== id);
+                setBatchQueue(newBatch);
+                saveBatchQueue(newBatch);
+            };
+
+            // Export functions
+            const exportToCSV = () => {
+                const leads = batchQueue.length > 0 ? batchQueue : getOfflineQueue().map(q => q.payload);
+                if (leads.length === 0) {
+                    alert('No leads to export');
+                    return;
+                }
+
+                const headers = ['First Name', 'Last Name', 'Email', 'Phone', 'Company', 'Job Title', 'Website', 'Address', 'Notes', 'Event', 'Priority', 'Rating', 'Follow-up Date', 'Lead Source'];
+                const rows = leads.map(l => [
+                    l.firstName, l.lastName, l.email, l.phone, l.company, l.jobTitle, l.website, l.address, l.notes, l.event || '', l.priority || '', l.rating || '', l.followUpDate || '', l.leadSource
+                ]);
+
+                const csv = [headers.join(','), ...rows.map(r => r.map(c => `"${(c || '').replace(/"/g, '""')}"`).join(','))].join('\n');
+                const blob = new Blob([csv], { type: 'text/csv' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `leads_${new Date().toISOString().split('T')[0]}.csv`;
+                a.click();
+                URL.revokeObjectURL(url);
+            };
+
+            const exportToVCard = () => {
+                const leads = batchQueue.length > 0 ? batchQueue : getOfflineQueue().map(q => q.payload);
+                if (leads.length === 0) {
+                    alert('No leads to export');
+                    return;
+                }
+
+                const vcards = leads.map(l => `BEGIN:VCARD
+VERSION:3.0
+N:${l.lastName};${l.firstName}
+FN:${l.firstName} ${l.lastName}
+ORG:${l.company || ''}
+TITLE:${l.jobTitle || ''}
+TEL:${l.phone || ''}
+EMAIL:${l.email || ''}
+URL:${l.website || ''}
+ADR:;;${l.address || ''}
+NOTE:${l.notes || ''}
+END:VCARD`).join('\n');
+
+                const blob = new Blob([vcards], { type: 'text/vcard' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `leads_${new Date().toISOString().split('T')[0]}.vcf`;
+                a.click();
+                URL.revokeObjectURL(url);
+            };
+
+            // Check for duplicates
+            const checkDuplicate = (email) => {
+                const queue = getOfflineQueue();
+                const existing = queue.find(q => q.payload.email?.toLowerCase() === email?.toLowerCase());
+                if (existing) {
+                    setDuplicateWarning(`Warning: A lead with email ${email} already exists in the queue.`);
+                } else {
+                    setDuplicateWarning(null);
+                }
+            };
+
+            // Calculate lead count from offline queue
+            const offlineQueueCount = getOfflineQueue().length;
+
+            return (
+                <div className="min-h-screen flex flex-col">
+                    <Header
+                        onSettingsClick={() => setShowSettings(true)}
+                        onHelpClick={() => setShowHelp(true)}
+                        isOnline={isOnline}
+                        leadCount={offlineQueueCount}
+                        batchCount={batchQueue.length}
+                    />
+
+                    <main className="flex-1 p-4">
+                        <div className="max-w-lg mx-auto">
+                            {!config.powerAutomateUrl && screen === 'camera' && (
+                                <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-4">
+                                    <div className="flex gap-3">
+                                        <svg className="w-5 h-5 text-yellow-600 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                                        </svg>
+                                        <div>
+                                            <p className="text-sm text-yellow-800 font-medium">Setup Required</p>
+                                            <p className="text-sm text-yellow-700 mt-1">
+                                                Configure your Power Automate URL in{' '}
+                                                <button
+                                                    onClick={() => setShowSettings(true)}
+                                                    className="underline font-medium"
+                                                >
+                                                    Settings
+                                                </button>
+                                                {' '}to submit leads.
+                                            </p>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Batch Mode Toggle & Export Buttons */}
+                            {screen === 'camera' && (
+                                <div className="flex justify-between items-center mb-4">
+                                    <div className="flex items-center gap-2">
+                                        <label className="flex items-center gap-2 cursor-pointer">
+                                            <input
+                                                type="checkbox"
+                                                checked={batchMode}
+                                                onChange={(e) => setBatchMode(e.target.checked)}
+                                                className="w-4 h-4 text-primary-600 rounded focus:ring-primary-500"
+                                            />
+                                            <span className="text-sm text-gray-700">Batch Mode</span>
+                                        </label>
+                                        {batchQueue.length > 0 && (
+                                            <span className="bg-primary-100 text-primary-800 text-xs px-2 py-1 rounded-full">
+                                                {batchQueue.length} queued
+                                            </span>
+                                        )}
+                                    </div>
+                                    <div className="flex gap-2">
+                                        <button
+                                            onClick={exportToCSV}
+                                            className="text-xs px-2 py-1 border border-gray-300 rounded hover:bg-gray-50"
+                                            title="Export to CSV"
+                                        >
+                                            CSV
+                                        </button>
+                                        <button
+                                            onClick={exportToVCard}
+                                            className="text-xs px-2 py-1 border border-gray-300 rounded hover:bg-gray-50"
+                                            title="Export to vCard"
+                                        >
+                                            vCard
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Batch Queue Preview */}
+                            {screen === 'camera' && batchQueue.length > 0 && (
+                                <div className="bg-gray-50 rounded-lg p-3 mb-4">
+                                    <div className="flex justify-between items-center mb-2">
+                                        <span className="text-sm font-medium text-gray-700">Batch Queue ({batchQueue.length})</span>
+                                        <button
+                                            onClick={handleSubmitBatch}
+                                            disabled={isSubmitting}
+                                            className="text-xs px-3 py-1 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50"
+                                        >
+                                            Submit All
+                                        </button>
+                                    </div>
+                                    <div className="space-y-1 max-h-32 overflow-y-auto">
+                                        {batchQueue.map((item) => (
+                                            <div key={item.id} className="flex justify-between items-center bg-white px-2 py-1 rounded text-sm">
+                                                <span>{item.firstName} {item.lastName} - {item.company || item.email}</span>
+                                                <button
+                                                    onClick={() => handleRemoveFromBatch(item.id)}
+                                                    className="text-red-500 hover:text-red-700 text-xs"
+                                                >
+                                                    Remove
+                                                </button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+
+                            {screen === 'camera' && (
+                                <CameraCapture
+                                    onCapture={handleCapture}
+                                    onManualEntry={handleManualEntry}
+                                />
+                            )}
+
+                            {/* Duplicate Warning */}
+                            {duplicateWarning && screen === 'form' && (
+                                <div className="bg-orange-50 border border-orange-200 rounded-lg p-3 mb-4">
+                                    <p className="text-sm text-orange-800">{duplicateWarning}</p>
+                                </div>
+                            )}
+
+                            {screen === 'form' && (
+                                <LeadForm
+                                    initialData={scannedData}
+                                    rawText={rawText}
+                                    onSubmit={batchMode ? handleAddToBatch : handleSubmit}
+                                    onBack={() => { setScreen('camera'); setDuplicateWarning(null); }}
+                                    isSubmitting={isSubmitting}
+                                    events={events}
+                                    onAddEvent={handleAddEvent}
+                                />
+                            )}
+
+                            {screen === 'success' && (
+                                <SuccessScreen
+                                    onScanAnother={handleScanAnother}
+                                    wasQueued={wasQueued}
+                                />
+                            )}
+                        </div>
+                    </main>
+
+                    <SettingsModal
+                        isOpen={showSettings}
+                        onClose={() => setShowSettings(false)}
+                        config={config}
+                        onSave={handleSaveConfig}
+                    />
+
+                    <HelpModal
+                        isOpen={showHelp}
+                        onClose={() => setShowHelp(false)}
+                    />
+                </div>
+            );
+        }
+
+        // ============================================
+        // RENDER
+        // ============================================
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
