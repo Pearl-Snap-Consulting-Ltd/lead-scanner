@@ -1240,8 +1240,9 @@
                 return '';
             };
 
-            const InputField = ({ label, field, type = 'text', required = false, placeholder = '', multiline = false }) => (
-                <div>
+            // Render a form field inline to avoid re-render issues
+            const renderField = (label, field, type = 'text', required = false, placeholder = '', multiline = false) => (
+                <div key={field}>
                     <label className="block text-sm font-medium text-gray-700 mb-1">
                         {label} {required && <span className="text-red-500">*</span>}
                     </label>
@@ -1306,11 +1307,11 @@
                     )}
 
                     <div className="grid grid-cols-2 gap-3">
-                        <InputField label="First Name" field="firstName" required placeholder="John" />
-                        <InputField label="Last Name" field="lastName" required placeholder="Smith" />
+                        {renderField("First Name", "firstName", "text", true, "John")}
+                        {renderField("Last Name", "lastName", "text", true, "Smith")}
                     </div>
 
-                    <InputField label="Email" field="email" type="email" required placeholder="john@company.com" />
+                    {renderField("Email", "email", "email", true, "john@company.com")}
 
                     {/* LinkedIn Lookup Button */}
                     {(formData.firstName || formData.lastName || formData.company) && (
@@ -1329,11 +1330,11 @@
                         </button>
                     )}
 
-                    <InputField label="Phone" field="phone" type="tel" placeholder="(555) 123-4567" />
-                    <InputField label="Company" field="company" placeholder="Acme Inc." />
-                    <InputField label="Job Title" field="jobTitle" placeholder="Sales Manager" />
-                    <InputField label="Website" field="website" type="url" placeholder="https://company.com" />
-                    <InputField label="Address" field="address" multiline placeholder="123 Main St, City, State 12345" />
+                    {renderField("Phone", "phone", "tel", false, "(555) 123-4567")}
+                    {renderField("Company", "company", "text", false, "Acme Inc.")}
+                    {renderField("Job Title", "jobTitle", "text", false, "Sales Manager")}
+                    {renderField("Website", "website", "url", false, "https://company.com")}
+                    {renderField("Address", "address", "text", false, "123 Main St, City, State 12345", true)}
 
                     {/* Notes with Voice Input */}
                     <div>
