@@ -1171,7 +1171,7 @@
                 leadSource: initialData?.leadSource || 'Business Card Scan',
                 // New fields
                 event: initialData?.event || '',
-                priority: initialData?.priority || 'normal', // normal, hot, cold
+                priority: initialData?.priority || 'Normal', // Normal, Hot, Cold (match SharePoint choices)
                 followUpDate: initialData?.followUpDate || '',
                 rating: initialData?.rating || 0 // 0-5 stars
             });
@@ -1463,20 +1463,20 @@
                         <div>
                             <label className="block text-sm font-medium text-gray-700 mb-1">Priority</label>
                             <div className="flex gap-1">
-                                {['cold', 'normal', 'hot'].map((p) => (
+                                {['Cold', 'Normal', 'Hot'].map((p) => (
                                     <button
                                         key={p}
                                         type="button"
                                         onClick={() => handleChange('priority', p)}
                                         className={`flex-1 px-2 py-2 rounded-lg text-sm font-medium border ${
                                             formData.priority === p
-                                                ? p === 'hot' ? 'bg-red-500 text-white border-red-500'
-                                                : p === 'cold' ? 'bg-blue-500 text-white border-blue-500'
+                                                ? p === 'Hot' ? 'bg-red-500 text-white border-red-500'
+                                                : p === 'Cold' ? 'bg-blue-500 text-white border-blue-500'
                                                 : 'bg-gray-500 text-white border-gray-500'
                                                 : 'border-gray-300 text-gray-700 hover:bg-gray-50'
                                         }`}
                                     >
-                                        {p === 'hot' ? '🔥 Hot' : p === 'cold' ? '❄️ Cold' : '➖ Normal'}
+                                        {p === 'Hot' ? '🔥 Hot' : p === 'Cold' ? '❄️ Cold' : '➖ Normal'}
                                     </button>
                                 ))}
                             </div>
