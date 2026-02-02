@@ -1715,14 +1715,25 @@
                         setWasQueued(true);
                         setScreen('success');
                     } else {
+                        console.log('Submitting to:', config.powerAutomateUrl);
+                        console.log('Payload:', JSON.stringify(payload, null, 2));
+
                         const response = await fetch(config.powerAutomateUrl, {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
+                            mode: 'cors',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json'
+                            },
                             body: JSON.stringify(payload)
                         });
 
+                        console.log('Response status:', response.status);
+
                         if (!response.ok) {
-                            throw new Error('Submission failed');
+                            const errorText = await response.text();
+                            console.error('Response error:', errorText);
+                            throw new Error(`Submission failed: ${response.status}`);
                         }
 
                         setWasQueued(false);
@@ -1730,6 +1741,7 @@
                     }
                 } catch (err) {
                     console.error('Submit error:', err);
+                    alert('Submit failed: ' + err.message + '\n\nLead saved to offline queue.');
                     // Queue for later if submission fails
                     addToOfflineQueue({ payload });
                     setWasQueued(true);
