@@ -1,4 +1,4 @@
-const CACHE_NAME = 'card-scanner-v1';
+const CACHE_NAME = 'card-scanner-v2';
 
 const STATIC_ASSETS = [
   '/',
