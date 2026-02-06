@@ -1,9 +1,10 @@
-const CACHE_NAME = 'card-scanner-v4';
+const CACHE_NAME = 'card-scanner-v5';
 
 const STATIC_ASSETS = [
   '/',
   '/index.html',
   '/manifest.json',
+  '/logo.png',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
 ];
